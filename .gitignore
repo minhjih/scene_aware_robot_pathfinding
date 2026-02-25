@@ -1,0 +1,11 @@
+*
+!.gitignore
+!/src/
+!/src/**
+!/checkpoints/
+!/checkpoints/**
+!/data/
+!/data/**
+!*.log
+!*.log
+!/data/
