@@ -25,6 +25,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
+# ── TensorFlow: memory growth mode ──────────────────────────────────────────
+# TF默认 grabs ALL GPU memory on import, starving Dr.Jit/Mitsuba.
+# Enable memory growth so TF only allocates what it actually needs,
+# leaving room for Mitsuba scene loading (~1–2 GB).
+import tensorflow as tf
+gpus = tf.config.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+
 # ── Sionna 1.2.1 imports ──────────────────────────────────────────────────────
 # sionna.rt uses Mitsuba 3 / Dr.Jit backend (auto-initializes CUDA variant)
 from sionna.rt import (
@@ -36,7 +45,6 @@ from sionna.rt import (
     Camera,
 )
 # sionna.phy.channel still uses TensorFlow for CIR→OFDM conversion
-import tensorflow as tf
 from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
 
 from src.config import (
