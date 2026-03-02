@@ -37,7 +37,7 @@ from src.config import (
     N_ROBOTS, MAX_STEPS, AP_POSITIONS,
     CHECKPOINT_DIR, CSI_MAP_PATH, RESULTS_DIR,
     MCS_SINR_THRESHOLD, SCENARIOS, T_POLL,
-    HUMAN_MESH, ROBOT_MESH,
+    HUMAN_MESH, ROBOT_MESH, NUM_DATA_SC,
 )
 from src.env import CAMAPFEnv
 from src.models import DualBranchNet
@@ -134,13 +134,23 @@ def draw_factory_background(ax, nav_xy):
                                     linewidth=2, zorder=1))
 
 
+def _nearest_ap_idx(robot_pos) -> int:
+    """Return index of nearest AP given a [world_x, world_z, world_y] position."""
+    rxy = np.array([float(robot_pos[0]), float(robot_pos[2])], dtype=np.float32)
+    dists = [np.linalg.norm(rxy - np.array([ap[0], ap[2]], dtype=np.float32))
+             for ap in AP_POSITIONS]
+    return int(np.argmin(dists))
+
+
 def _build_sinr_grid(grid_positions, sinr_map):
     sinr_grid = np.full((40, 40), np.nan, dtype=np.float32)
-    for idx, sinr_arr in sinr_map.items():
+    for idx, sinr_dict in sinr_map.items():
         wp = grid_positions[idx]
         xi = round((float(wp[0]) - 1) / 2)
         yi = round((-float(wp[2]) - 1.5) / 2)
         if 0 <= xi < 40 and 0 <= yi < 40:
+            ap_idx = _nearest_ap_idx(wp)
+            sinr_arr = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC, dtype=np.float32))
             sinr_grid[yi, xi] = float(10 * np.log10(np.mean(sinr_arr) + 1e-12))
     return sinr_grid
 

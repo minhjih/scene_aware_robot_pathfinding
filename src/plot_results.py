@@ -13,7 +13,7 @@ import os, sys, json, argparse, pickle
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import (
     SCENARIOS, BASELINES, METRICS, RESULTS_DIR, CHECKPOINT_DIR,
-    CSI_MAP_PATH, NUM_DATA_SC,
+    CSI_MAP_PATH, NUM_DATA_SC, AP_POSITIONS,
 )
 
 import numpy as np
@@ -52,6 +52,14 @@ BASELINE_LABELS = {
     "ours_supervised": "Dual-Branch (SL)",
     "ours_ppo":        "CA-MAPF (PPO)",
 }
+
+
+def _nearest_ap_idx(robot_pos) -> int:
+    """Return index of nearest AP given a [world_x, world_z, world_y] position."""
+    rxy = np.array([float(robot_pos[0]), float(robot_pos[2])], dtype=np.float32)
+    dists = [np.linalg.norm(rxy - np.array([ap[0], ap[2]], dtype=np.float32))
+             for ap in AP_POSITIONS]
+    return int(np.argmin(dists))
 
 
 def load_results(results_dir):
@@ -192,7 +200,9 @@ def plot_sinr_heatmap(results_dir):
     for idx, pos in enumerate(grid_positions):
         xi = np.searchsorted(xs, pos[0])
         yi = np.searchsorted(ys, pos[2])
-        sinr = sinr_map.get(idx, np.zeros(NUM_DATA_SC))
+        sinr_dict = sinr_map.get(idx, {})
+        ap_idx = _nearest_ap_idx(pos)
+        sinr = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC, dtype=np.float32))
         sinr_db = float(10 * np.log10(np.mean(sinr) + 1e-12))
         if 0 <= xi < len(xs) and 0 <= yi < len(ys):
             grid[yi, xi] = sinr_db
@@ -203,11 +213,9 @@ def plot_sinr_heatmap(results_dir):
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("Mean SINR (dB)")
     ax.set_xlabel("World X (m)"); ax.set_ylabel("World Y (m)")
-    ax.set_title("Factory SINR Map (Mean over Subcarriers)")
+    ax.set_title("Factory SINR Map (Nearest AP, Mean over Subcarriers)")
 
-    # Mark AP positions
-    from src.config import AP_POSITIONS as _aps
-    for i, ap in enumerate(_aps):
+    for i, ap in enumerate(AP_POSITIONS):
         # ap = [world_x, world_z, world_y]; plot in (x, y) plane
         ax.plot(ap[0], ap[2], "k^", markersize=10)
         ax.annotate(f"AP{i+1}", (ap[0], ap[2]), textcoords="offset points",
@@ -240,7 +248,9 @@ def plot_throughput_heatmap(results_dir):
     for idx, pos in enumerate(grid_positions):
         xi = np.searchsorted(xs, pos[0])
         yi = np.searchsorted(ys, pos[2])
-        sinr = sinr_map.get(idx, np.zeros(NUM_DATA_SC))
+        sinr_dict = sinr_map.get(idx, {})
+        ap_idx = _nearest_ap_idx(pos)
+        sinr = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC, dtype=np.float32))
         sinr_db = float(10 * np.log10(np.mean(sinr) + 1e-12))
         tp = sinr_to_throughput(sinr_db, n_cell=1)
         if 0 <= xi < len(xs) and 0 <= yi < len(ys):
@@ -254,7 +264,6 @@ def plot_throughput_heatmap(results_dir):
     ax.set_xlabel("World X (m)"); ax.set_ylabel("World Y (m)")
     ax.set_title("Factory Throughput Map (N_cell=1)")
 
-    from src.config import AP_POSITIONS
     for i, ap in enumerate(AP_POSITIONS):
         # ap = [world_x, world_z, world_y]
         ax.plot(ap[0], ap[2], "w^", markersize=10)

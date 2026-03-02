@@ -245,7 +245,11 @@ def train(args):
         grid_positions, csi_map, sinr_map,
         n_robots=N_ROBOTS, max_steps=MAX_STEPS,
         n_humans=N_HUMANS, dynamic_obs=True,
+        sched_policy=args.sched_policy,
+        sched_noise_std_db=args.sched_noise,
     )
+    print(f"[train] AP scheduling policy : {args.sched_policy}"
+          f"  (noise={args.sched_noise} dB)")
     model              = DualBranchNet(n_humans=N_HUMANS).to(device)
     centralized_critic = CentralizedCritic(n_robots=N_ROBOTS).to(device)
     optimizer = Adam(
@@ -274,7 +278,7 @@ def train(args):
     log_path = os.path.join(args.save_dir, "train_log.csv")
     if not os.path.exists(log_path):
         with open(log_path, "w") as f:
-            f.write("episode,mean_return,loss,tp_loss,entropy\n")
+            f.write("episode,mean_return,loss,tp_loss,entropy,sched_policy\n")
 
     print(f"[train] Starting PPO for {args.max_episodes} episodes ...")
     t0 = time.time()
@@ -307,12 +311,21 @@ def train(args):
             print(f"Ep {ep:5d} | ret={mean_ret:8.2f} | "
                   f"loss={last_m.get('loss',0):.4f} | "
                   f"tp={last_m.get('tp',0):.4f} | "
-                  f"entropy={last_m.get('entropy',0):.3f} | t={elapsed:.0f}s")
+                  f"entropy={last_m.get('entropy',0):.3f} | "
+                  f"sched={args.sched_policy} | t={elapsed:.0f}s")
             with open(log_path, "a") as f:
                 f.write(f"{ep},{mean_ret:.4f},"
                         f"{last_m.get('loss',0):.6f},"
                         f"{last_m.get('tp',0):.6f},"
-                        f"{last_m.get('entropy',0):.6f}\n")
+                        f"{last_m.get('entropy',0):.6f},"
+                        f"{args.sched_policy}\n")
+
+        # NaN guard: never persist a corrupt checkpoint.
+        model_nan = any(not torch.isfinite(v).all()
+                        for v in model.state_dict().values())
+        if model_nan:
+            print(f"[train] Ep {ep}: NaN detected in model — skipping checkpoint save")
+            continue
 
         ckpt_data = {
             "model":     model.state_dict(),
@@ -334,7 +347,24 @@ def main():
     parser.add_argument("--csi_map",      default=CSI_MAP_PATH)
     parser.add_argument("--max_episodes", type=int, default=MAX_EPISODES)
     parser.add_argument("--save_dir",     default=CHECKPOINT_DIR)
+    # 802.11ax AP scheduling policy for this training run.
+    # 'proportional_fair' : PF — de-facto enterprise Wi-Fi 6 standard.
+    #                        RL learns optimal movement under fairness-driven AP.
+    # 'auto'              : congestion-adaptive (max_sinr→PF→deadline_aware→rr).
+    #                        RL learns to handle varying AP behaviour.
+    # specific methods    : 'round_robin'|'max_sinr'|'deadline_aware' for ablations.
+    parser.add_argument("--sched_policy", default="proportional_fair",
+                        choices=["proportional_fair", "auto",
+                                 "round_robin", "max_sinr", "deadline_aware"],
+                        help="AP UL MU-OFDMA scheduling policy")
+    parser.add_argument("--sched_noise",  type=float, default=1.5,
+                        help="AP-side SINR estimation noise std (dB, 0=deterministic)")
     args = parser.parse_args()
+
+    # Auto-suffix save_dir with scheduling policy to keep runs separate.
+    if args.save_dir == CHECKPOINT_DIR:
+        args.save_dir = os.path.join(CHECKPOINT_DIR, args.sched_policy)
+
     train(args)
 
 

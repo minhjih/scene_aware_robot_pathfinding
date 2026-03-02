@@ -30,7 +30,7 @@ from src.config import (
     N_ROBOTS, N_HUMANS, MAX_STEPS,
     AP_POSITIONS, CHECKPOINT_DIR, CSI_MAP_PATH,
     HUMAN_MESH, ROBOT_MESH, RESULTS_DIR,
-    MCS_SINR_THRESHOLD,
+    MCS_SINR_THRESHOLD, NUM_DATA_SC,
 )
 from src.env import CAMAPFEnv
 from src.models import DualBranchNet
@@ -144,10 +144,19 @@ def draw_factory_background(ax, nav_xy: np.ndarray):
 
 # ── Episode rollout ───────────────────────────────────────────────────────────
 
+def _nearest_ap_idx(robot_pos: np.ndarray) -> int:
+    """Return index of nearest AP given a [world_x, world_z, world_y] position."""
+    rxy = np.array([robot_pos[0], robot_pos[2]], dtype=np.float32)
+    dists = [np.linalg.norm(rxy - np.array([ap[0], ap[2]], dtype=np.float32))
+             for ap in AP_POSITIONS]
+    return int(np.argmin(dists))
+
+
 def _build_sinr_grid(grid_positions: np.ndarray,
                      sinr_map: dict) -> np.ndarray:
     """
     Build a 40×40 mean-SINR (dB) grid for the radiomap overlay.
+    Uses nearest-AP SINR from the per-AP sinr_map.
 
     grid_positions columns: [world_x, world_z, world_y]
       xi = round((world_x - 1) / 2)   ∈ [0, 39]
@@ -156,13 +165,15 @@ def _build_sinr_grid(grid_positions: np.ndarray,
     Returns float32 array (40, 40), NaN for blocked cells.
     """
     sinr_grid = np.full((40, 40), np.nan, dtype=np.float32)
-    for idx, sinr_arr in sinr_map.items():
+    for idx, sinr_dict in sinr_map.items():
         wp = grid_positions[idx]
         wx = float(wp[0])    # world_x
         wy = float(wp[2])    # world_y  (nav plane column 2)
         xi = round((wx - 1) / 2)
         yi = round((-wy - 1.5) / 2)
         if 0 <= xi < 40 and 0 <= yi < 40:
+            ap_idx = _nearest_ap_idx(wp)
+            sinr_arr = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC, dtype=np.float32))
             sinr_db = float(10 * np.log10(np.mean(sinr_arr) + 1e-12))
             sinr_grid[yi, xi] = sinr_db
     return sinr_grid

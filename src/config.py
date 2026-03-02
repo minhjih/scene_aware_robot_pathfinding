@@ -153,7 +153,15 @@ T_PENALTY   = 16e-3   # 802.11ax trigger-frame retransmit penalty (s)
 # IEEE 802.11ax (Wi-Fi 6) at 5.18 GHz, UNII-1 indoor factory:
 #   FCC Part 15.407 UNII-1: conducted TX power ≤ 17 dBm (50 mW).
 #   AGV/STA uplink (embedded device, 5 GHz): 13 dBm (20 mW) = 0.020 W.
-P_TX        = 0.020   # W  (13 dBm — robot STA UL, 5 GHz UNII-1)
+P_TX        = 0.020   # W  (13 dBm — robot STA UL, max TX power / precompute ref)
+P_TX_MIN    = 1e-5    # W  (-20 dBm — minimum STA TX power; practical floor)
+
+# 802.11ax open-loop UL power control (Trigger Frame "Target RSSI" field).
+#   AP specifies per-STA target received power so near STAs back off,
+#   avoiding near-far problem in MU-OFDMA.
+#   -70 dBm = 1e-10 W — typical indoor factory AP target for balanced UL.
+#   Effect: near robots reduce power (SINR capped), far robots stay at P_TX_MAX.
+P_RX_TARGET = 1e-10   # W  (-70 dBm — target AP received power for UL power ctrl)
 
 # Thermal noise at AP receiver:  N = k·T·B·F
 #   k = 1.38e-23 J/K,  T = 290 K (IEEE std temp),  B = 20 MHz
@@ -175,6 +183,37 @@ MAX_THROUGHPUT_MBPS = 200.0
 # With 32 AGVs / 4 APs, average 8/AP.  Padded with zeros when fewer are present.
 # Gives model visibility into near-future n_cell (who is about to contend for the AP).
 MAX_AGENTS_PER_AP = 8
+
+# ── UL MU-OFDMA Scheduling Policies ──────────────────────────────────────────
+# The RL agent selects one of these per-step as a "scheduling preference"
+# (analogous to 802.11ax EDCA Access Category).  The AP uses the signalled
+# preference together with measured SINR to assign a TF round.
+#
+# SCHED_METHODS index ↔ EDCA Access Category:
+#   0 'round_robin'       ↔ AC_BK (Background)     — FIFO, no channel info
+#   1 'proportional_fair' ↔ AC_BE (Best Effort)     — history-aware fairness
+#   2 'max_sinr'          ↔ AC_VI (Video)           — throughput-greedy
+#   3 'deadline_aware'    ↔ AC_VO (Voice)           — latency-critical protection
+#
+# The agent learns: in congestion with good SINR → prefer max_sinr (early round);
+#                   far from AP/weak link → prefer deadline_aware (protection);
+#                   recovering from starvation → prefer proportional_fair.
+SCHED_METHODS = ['round_robin', 'proportional_fair', 'max_sinr', 'deadline_aware']
+
+# AP-side SINR measurement noise (dB, 1-σ log-normal).
+# 802.11ax HE-NDP sounding gives ~1–2 dB CSI quantisation + estimation error.
+# Applied to all rank-based methods before sorting (not round_robin).
+SCHED_NOISE_STD_DB = 1.5
+
+# Default / fallback scheduling policy for the AP.
+#   'random' : AP randomly picks from SCHED_METHODS each step → domain randomization
+#              during training so the agent learns policies robust to any AP behavior.
+#   'auto'   : AP picks method based on current n_cell (congestion-aware):
+#              n_cell ≤ 2 → max_sinr, ≤ 4 → proportional_fair,
+#              ≤ 8 → deadline_aware, > 8 → round_robin
+#   specific : always that method ('round_robin'|'proportional_fair'|
+#              'max_sinr'|'deadline_aware')
+SCHEDULING_METHOD = 'proportional_fair'
 
 # 802.11ax HE PPDU preamble overhead (μs → s)
 # HE-STF(8) + HE-LTF(8+4*N_LTF) + HE-SIG-A(8) + HE-SIG-B + L-preamble(20)

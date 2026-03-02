@@ -10,7 +10,15 @@ Observation (per robot):
     human_obs: (N_humans * 2,)        visible human [dist, angle] pairs
 
 Action: Discrete(9) — 8 cardinal/diagonal directions + wait (index 8)
+
+802.11ax AP scheduling is handled by the environment (not the agent).
+The AP selects a scheduling algorithm per step based on sched_policy:
+  'random' : randomly picks from SCHED_METHODS (domain randomization for training)
+  'auto'   : picks based on n_cell (congestion-adaptive, see _pick_sched_method)
+  specific : always that method ('round_robin'|'proportional_fair'|
+             'max_sinr'|'deadline_aware')
 """
+import collections
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -25,9 +33,14 @@ from src.config import (
     N_HUMANS, HUMAN_DETECTION_RANGE, ROBOT_FOV_DEG,
     HUMAN_SHADOW_DB, HUMAN_SHADOW_RADIUS,
     T_POLL, MAX_THROUGHPUT_MBPS, MAX_AGENTS_PER_AP,
+    P_TX, P_TX_MIN, P_RX_TARGET, NOISE_VAR,
+    SCHED_METHODS, SCHED_NOISE_STD_DB, SCHEDULING_METHOD,
 )
 from src.wifi_layer import (
-    select_mcs, get_ru_type, compute_throughput, compute_comm_delay,
+    select_mcs, get_ru_type, get_n_rounds,
+    select_best_ru_block,
+    compute_tx_power_control, assign_scheduling_round,
+    compute_throughput, compute_comm_delay,
 )
 from src.human_agent import HumanManager
 
@@ -53,15 +66,17 @@ class CAMAPFEnv(gym.Env):
         self,
         grid_positions: np.ndarray,    # (N, 3) float32, world coords
         csi_map: dict,                  # {idx: (C_in, K, T)}
-        sinr_map: dict,                 # {idx: (K,)}
+        sinr_map: dict,                 # {idx: {ap_idx: (K,)}}
         n_robots: int = N_ROBOTS,
         max_steps: int = MAX_STEPS,
         lambda_comm: float = LAMBDA_COMM,
         r_goal: float = R_GOAL,
         n_humans: int = N_HUMANS,
-        n_cell_override: int = None,    # fixed cell load for scenario control
-        v_robot: float = 1.0,           # robot speed m/s
-        dynamic_obs: bool = True,       # enable dynamic human agents
+        n_cell_override: int = None,        # fixed cell load for scenario control
+        v_robot: float = 1.0,               # robot speed m/s
+        dynamic_obs: bool = True,           # enable dynamic human agents
+        sched_policy: str = SCHEDULING_METHOD,        # AP scheduling policy
+        sched_noise_std_db: float = SCHED_NOISE_STD_DB,  # AP SINR estimation noise
     ):
         super().__init__()
         self.grid_positions  = grid_positions    # (N, 3)
@@ -72,10 +87,13 @@ class CAMAPFEnv(gym.Env):
         self.lambda_comm     = lambda_comm
         self.r_goal          = r_goal
         self.n_humans        = n_humans
-        self.n_cell_override = n_cell_override
-        self.v_robot         = v_robot
-        self.dynamic_obs     = dynamic_obs
-        self.N               = len(grid_positions)
+        self.n_cell_override     = n_cell_override
+        self.v_robot             = v_robot
+        self.dynamic_obs         = dynamic_obs
+        self.sched_policy        = sched_policy
+        self.sched_noise_std_db  = sched_noise_std_db
+        self.N                   = len(grid_positions)
+        self._sched_rng          = np.random.default_rng()
 
         # grid_positions columns: [world_x, world_z, world_y]
         # Navigation plane = (world_x, world_y) = columns 0 and 2
@@ -111,6 +129,8 @@ class CAMAPFEnv(gym.Env):
         self.headings          = None   # (n_robots, 2) robot facing directions
         self.reservation       = None
         self.state_history     = None
+        # Rolling throughput history per robot (for PF scheduling metric)
+        self.tp_history        = None   # {robot_id: deque of R_actual (Mbps)}
         self.step_count        = 0
         self._current_robot_id = 0
 
@@ -176,6 +196,13 @@ class CAMAPFEnv(gym.Env):
             i: np.zeros((T_WIN, 3), dtype=np.float32)
             for i in range(self.n_robots)
         }
+        # Per-robot rolling throughput history (window=T_WIN) for PF scheduling.
+        # Initialised to 1.0 Mbps (neutral PF score) so all robots start equal.
+        self.tp_history = {
+            i: collections.deque([1.0] * T_WIN, maxlen=T_WIN)
+            for i in range(self.n_robots)
+        }
+        self._sched_rng        = np.random.default_rng(seed)
         self.step_count        = 0
         self._current_robot_id = 0
 
@@ -185,12 +212,42 @@ class CAMAPFEnv(gym.Env):
         obs = self._get_obs(0)
         return obs, {}
 
+    # ── AP scheduling policy selector ──────────────────────────────────────────
+    def _pick_sched_method(self, n_cell: int) -> str:
+        """
+        AP decides which 802.11ax UL scheduling algorithm to apply this step.
+
+        'random' : uniform random from SCHED_METHODS — domain randomization for
+                   training.  Forces agent to learn robust movement regardless of
+                   which algorithm the AP happens to run.
+
+        'auto'   : congestion-adaptive selection (mimics real AP firmware logic):
+                     n_cell ≤ 2 → max_sinr         (low load: maximise throughput)
+                     n_cell ≤ 4 → proportional_fair (medium: fairness + throughput)
+                     n_cell ≤ 8 → deadline_aware    (high: protect weak links)
+                     n_cell > 8 → round_robin       (extreme: equal chance for all)
+
+        specific : always that named method.
+        """
+        if self.sched_policy == 'random':
+            return SCHED_METHODS[self._sched_rng.integers(0, len(SCHED_METHODS))]
+        if self.sched_policy == 'auto':
+            if n_cell <= 2:
+                return 'max_sinr'
+            elif n_cell <= 4:
+                return 'proportional_fair'
+            elif n_cell <= 8:
+                return 'deadline_aware'
+            else:
+                return 'round_robin'
+        return self.sched_policy   # fixed named method
+
     # ── Step ───────────────────────────────────────────────────────────────────
     def step(self, action: int):
         robot_id = self._current_robot_id
         cur_pos  = self.positions[robot_id]
 
-        # Apply action
+        # Apply movement action
         if action == 8:
             next_pos = cur_pos
         else:
@@ -213,7 +270,13 @@ class CAMAPFEnv(gym.Env):
         else:
             n_cell = self._get_n_cell(next_pos)
 
-        sinr_arr = self.sinr_map.get(next_pos, np.zeros(NUM_DATA_SC))
+        # Per-AP SINR: look up the nearest AP's SINR array
+        my_ap = self._nearest_ap(next_pos)
+        sinr_dict = self.sinr_map.get(next_pos, None)
+        if sinr_dict is not None:
+            sinr_arr = sinr_dict.get(my_ap, np.zeros(NUM_DATA_SC, dtype=np.float32))
+        else:
+            sinr_arr = np.zeros(NUM_DATA_SC, dtype=np.float32)
 
         # Apply RF shadowing from nearby humans
         if self.human_manager:
@@ -222,20 +285,65 @@ class CAMAPFEnv(gym.Env):
             shadow_lin  = 10 ** (-shadow_db / 10.0)
             sinr_arr    = sinr_arr * shadow_lin
 
-        sinr_db  = float(10 * np.log10(np.mean(sinr_arr) + 1e-12))
-        mcs      = select_mcs(sinr_db)
-        ru_type  = get_ru_type(n_cell)
+        # ── 802.11ax UL MU-OFDMA: power control + scheduling ───────────────
+        ru_type = get_ru_type(n_cell)
+
+        # Step 1: Wideband open-loop power control (standard-compliant).
+        # STA estimates path loss from full-band TF RSSI, NOT per-block SINR.
+        p_tx_act, pc_scale = compute_tx_power_control(
+            sinr_arr, P_RX_TARGET, NOISE_VAR, P_TX, P_TX_MIN, P_TX,
+        )
+        # Apply uniform power-control scale to all subcarriers
+        sinr_arr_pc = sinr_arr * pc_scale
+
+        # Step 2: Frequency-selective RU block assignment.
+        # AP assigns each STA to the best available RU block (highest SINR)
+        # within the allocated RU type — after power-controlled SINR.
+        block_idx, sinr_ru_db = select_best_ru_block(sinr_arr_pc, ru_type)
+        mcs      = select_mcs(sinr_ru_db)
         R_actual = compute_throughput(mcs, ru_type)
-        T_comm   = compute_comm_delay(R_actual, mcs)
+
+        # Step 3: AP decides scheduling algorithm, then assigns TF round.
+        # The AP's choice is driven by sched_policy (random/auto/fixed).
+        # SINR estimation noise simulates 802.11ax HE-NDP sounding uncertainty.
+        sched_method = self._pick_sched_method(n_cell)
+
+        sinr_self_lin = float(np.mean(sinr_arr_pc))
+        tp_self       = float(np.mean(self.tp_history[robot_id]))
+
+        sinr_peers_lin   = []
+        tp_history_peers = []
+        for i in range(self.n_robots):
+            if i == robot_id:
+                continue
+            if self._nearest_ap(self.positions[i]) == my_ap:
+                peer_sinr_dict = self.sinr_map.get(self.positions[i], {})
+                s_peer = peer_sinr_dict.get(my_ap,
+                                            np.zeros(NUM_DATA_SC, dtype=np.float32))
+                sinr_peers_lin.append(float(np.mean(s_peer)) * pc_scale)
+                tp_history_peers.append(float(np.mean(self.tp_history[i])))
+
+        round_idx = assign_scheduling_round(
+            sinr_self_lin, sinr_peers_lin, n_cell, ru_type,
+            sched_method,
+            sinr_noise_std_db=self.sched_noise_std_db,
+            rng=self._sched_rng,
+            tp_history_self=tp_self,
+            tp_history_peers=tp_history_peers,
+        )
+        T_comm_round = compute_comm_delay(R_actual, mcs)
+        T_comm       = round_idx * T_comm_round   # path planning cost
 
         # ── Reward ─────────────────────────────────────────────────────────
-        # Polling-deadline penalty: if T_comm exceeds the AP's polling interval
-        # (T_POLL = 1/upload_rate), the robot misses its next scheduled UL slot.
-        # T_move >> T_POLL is irrelevant here; what matters is the uplink deadline.
+        # Polling-deadline penalty: if T_effective exceeds T_POLL the robot
+        # misses its uplink slot (or must wait an extra poll cycle).
+        # T_comm is finite because get_ru_type caps n_cell at 16 (no Overflow).
+        # Clip reward as a safety net to prevent -inf propagating to GAE/NaN.
         comm_penalty = max(0.0, T_comm - T_POLL)
         reward = -T_move - self.lambda_comm * comm_penalty
         if next_pos == self.goals[robot_id]:
             reward += self.r_goal
+        reward = max(reward, -50.0)   # safety clip: prevents GAE divergence
 
         # Penalty for moving into a human-occupied cell
         if self.human_manager:
@@ -248,6 +356,8 @@ class CAMAPFEnv(gym.Env):
         self.positions[robot_id] = next_pos
         self._update_state_history(robot_id, mcs, n_cell, R_actual)
         self._update_reservation(next_pos)
+        # Update rolling throughput history (used for PF scheduling metric)
+        self.tp_history[robot_id].append(R_actual)
 
         # Advance all humans one step (dynamic obstacles)
         if self.human_manager and self.dynamic_obs:
@@ -260,8 +370,10 @@ class CAMAPFEnv(gym.Env):
         truncated = self.step_count >= self.max_steps
         info = {
             "mcs": mcs, "R_actual": R_actual,
-            "T_comm": T_comm, "n_cell": n_cell,
-            "T_move": T_move, "comm_penalty": comm_penalty,
+            "sinr_ru_db": sinr_ru_db, "p_tx_act": p_tx_act, "pc_scale": pc_scale,
+            "round_idx": round_idx, "T_comm": T_comm, "T_comm_round": T_comm_round,
+            "n_cell": n_cell, "T_move": T_move, "comm_penalty": comm_penalty,
+            "sched_method": sched_method,
         }
         return self._get_obs(self._current_robot_id), reward, all_done, truncated, info
 

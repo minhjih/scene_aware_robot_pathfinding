@@ -59,8 +59,10 @@ def path_metrics(path, grid_positions, sinr_map, reservation=None,
         # Realistic n_cell from scenario range
         n_cell = int(np.random.randint(n_cell_range[0], n_cell_range[1] + 1))
 
-        sinr    = sinr_map.get(v, np.zeros(NUM_DATA_SC))
-        sinr_db = float(10 * np.log10(np.mean(sinr) + 1e-12))
+        sinr_dict = sinr_map.get(v, {})
+        ap_idx    = _nearest_ap(grid_positions[v])
+        sinr      = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC, dtype=np.float32))
+        sinr_db   = float(10 * np.log10(np.mean(sinr) + 1e-12))
         mcs     = select_mcs(sinr_db)
         ru      = get_ru_type(n_cell)
         R_act   = compute_throughput(mcs, ru)

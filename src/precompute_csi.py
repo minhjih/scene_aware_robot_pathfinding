@@ -109,34 +109,38 @@ def _extract_h(a_batch: tf.Tensor,
         raise RuntimeError(f"_extract_h failed for slot {rx_slot}: {e}") from e
 
 
-def _postbf_sinr(H_complex: tf.Tensor,
+def _per_ap_sinr(H_complex: tf.Tensor,
                  p_tx: float = P_TX,
-                 noise_var: float = NOISE_VAR) -> tf.Tensor:
+                 noise_var: float = NOISE_VAR) -> dict:
     """
-    SVD beamforming SINR per subcarrier.
+    Per-AP SISO SINR per subcarrier.
 
-    H_complex: (N_rx, N_tx, K) — complex64, where N_tx = N_APs
-    Returns:   (K,)            — float32 SINR (linear)
+    H_complex: (N_rx=1, N_APs, K) — complex64
+    Returns:   {ap_idx: np.ndarray (K,)} — float32 SINR (linear) per AP
 
-    With N_rx=1, N_tx=N_APs, Hk = [1, N_APs].  SVD gives singular value =
-    ||h_k||_2 (MRC gain combining all APs), which is the optimal receive gain.
+    802.11ax STA connects to one AP at a time (no multi-AP MRC).
+    SINR = |H[0, ap, k]|² × P_TX / NOISE_VAR  (SISO path gain).
     """
-    sinr_list = []
-    for k in range(NUM_DATA_SC):
-        Hk      = H_complex[:, :, k]           # (N_rx=1, N_tx=N_APs)
-        s       = tf.linalg.svd(Hk, compute_uv=False)
-        bf_gain = tf.square(tf.abs(s[0]))       # dominant singular value squared
-        sinr_list.append((bf_gain * p_tx) / noise_var)
-    return tf.stack(sinr_list)                  # (K,)
+    n_aps = int(H_complex.shape[1])
+    result = {}
+    for ap in range(n_aps):
+        h_ap = H_complex[0, ap, :]                    # (K,) complex
+        gain = tf.square(tf.abs(h_ap))                 # |h|² per subcarrier
+        sinr = (gain * p_tx) / noise_var               # (K,) linear SINR
+        result[ap] = sinr.numpy().astype(np.float32)   # (K,) float32
+    return result
 
 
 # ── Fallback: free-space path loss ────────────────────────────────────────────
 
 def _fallback_channel(position: np.ndarray):
-    """Distance-based FSPL channel when ray tracing fails."""
+    """Distance-based FSPL channel when ray tracing fails.
+
+    Returns (H_mag, sinr_per_ap) where sinr_per_ap is {ap_idx: (K,) float32}.
+    """
     import math
     H_mag = np.zeros((N_RX, N_TX, NUM_DATA_SC), dtype=np.float32)
-    sinr  = np.zeros(NUM_DATA_SC, dtype=np.float32)
+    sinr_per_ap = {}
     lam   = 3e8 / CARRIER_FREQ
 
     for i, ap in enumerate(AP_POSITIONS):
@@ -147,13 +151,11 @@ def _fallback_channel(position: np.ndarray):
         fspl = (lam / (4 * math.pi * d)) ** 2
         gain = math.sqrt(fspl)
 
-        for k in range(NUM_DATA_SC):
-            H_mag[0, i % N_TX, k] += gain / N_TX
+        H_mag[0, i % N_TX, :] = gain
+        sinr_per_ap[i] = np.full(NUM_DATA_SC, gain ** 2 * P_TX / NOISE_VAR,
+                                 dtype=np.float32)
 
-        sinr_k = (gain ** 2 * P_TX) / NOISE_VAR
-        sinr  += sinr_k / len(AP_POSITIONS)
-
-    return H_mag, sinr
+    return H_mag, sinr_per_ap
 
 
 # ── CSI tensor formatter ──────────────────────────────────────────────────────
@@ -227,9 +229,9 @@ def _compute_batch(scene, positions_batch: np.ndarray):
             slot = min(j, n_rx_total - 1)
             try:
                 h = _extract_h(a_batch, tau_batch, slot)
-                sinr  = _postbf_sinr(h)
+                sinr_per_ap = _per_ap_sinr(h)
                 H_mag = tf.abs(h).numpy()
-                results.append((H_mag, sinr.numpy()))
+                results.append((H_mag, sinr_per_ap))
             except Exception as e:
                 print(f"    [warn] slot {j}: {e}")
                 results.append(_fallback_channel(positions_batch[j]))
@@ -375,10 +377,10 @@ def precompute_csi(scene_name: str = "car_factory_2line"):
 
         batch_results = _compute_batch(scene, batch_pos)
 
-        for j, (H_mag, sinr) in enumerate(batch_results):
+        for j, (H_mag, sinr_per_ap) in enumerate(batch_results):
             idx = batch_start + j
-            csi_map[idx]  = to_cnn_input(H_mag)   # (C_in, K, T)
-            sinr_map[idx] = sinr                    # (K,)
+            csi_map[idx]  = to_cnn_input(H_mag)       # (C_in, K, T)
+            sinr_map[idx] = sinr_per_ap                # {ap_idx: (K,)}
 
         # Checkpoint every 10 batches
         if (batch_start // RT_BATCH_SIZE) % 10 == 0:

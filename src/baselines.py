@@ -17,9 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import (
     AP_POSITIONS, NUM_DATA_SC, C_IN, T_WIN, LAMBDA_COMM, L_DATA, T_PENALTY,
     MCS_SINR_THRESHOLD, N_HUMANS, N_ROBOTS, MAX_THROUGHPUT_MBPS, T_POLL,
+    P_TX, P_TX_MIN, P_RX_TARGET, NOISE_VAR, SCHEDULING_METHOD,
 )
 from src.wifi_layer import (
-    select_mcs, get_ru_type, compute_throughput, compute_comm_delay,
+    select_mcs, get_ru_type, get_n_rounds,
+    select_best_ru_block,
+    compute_tx_power_control, assign_scheduling_round,
+    compute_throughput, compute_comm_delay,
 )
 from src.models import DualBranchNet, MLPBaseline
 from src.env import MOVE_DELTAS, GRID_RESOLUTION
@@ -77,9 +81,12 @@ def a_star_snr_threshold(grid_positions, neighbors, sinr_map, start, goal,
                           sinr_threshold_db: float = -1.0):
     """
     A* that avoids nodes where mean SINR < threshold.
+    Uses per-AP SINR from nearest AP.
     """
     def node_ok(idx):
-        sinr = sinr_map.get(idx, np.zeros(NUM_DATA_SC))
+        sinr_dict = sinr_map.get(idx, {})
+        ap_idx = _nearest_ap(grid_positions[idx])
+        sinr = sinr_dict.get(ap_idx, np.zeros(NUM_DATA_SC))
         sinr_db = 10 * np.log10(np.mean(sinr) + 1e-12)
         return sinr_db >= sinr_threshold_db
 
@@ -182,11 +189,30 @@ def pa_star(grid_positions, neighbors, sinr_map, csi_map,
                 _, _, R_hat = model(C_v, s_v, h_zero)
             R_hat_val = max(R_hat.item(), 0.01)
 
-            # Communication delay
-            sinr    = sinr_map.get(v, np.zeros(NUM_DATA_SC))
-            sinr_db = float(10 * np.log10(np.mean(sinr) + 1e-12))
-            mcs     = select_mcs(sinr_db)
-            T_comm  = compute_comm_delay(R_hat_val, mcs)
+            # Communication delay: multi-round TF + wideband PC + scheduling
+            # PA-STAR has no real-time AP load or peer SINR info, so we use:
+            #   n_cell_est  = mean load across 4 APs
+            #   round_idx   = worst-case n_rounds (round_robin conservative)
+            n_cell_est  = max(1, N_ROBOTS // len(AP_POSITIONS))
+            ru_type_est = get_ru_type(n_cell_est)
+
+            sinr_dict = sinr_map.get(v, {})
+            sinr = sinr_dict.get(ap, np.zeros(NUM_DATA_SC, dtype=np.float32))
+            # Wideband power control
+            _, pc_scale = compute_tx_power_control(
+                sinr, P_RX_TARGET, NOISE_VAR, P_TX, P_TX_MIN, P_TX,
+            )
+            sinr_pc = sinr * pc_scale
+            # Best RU block after power control
+            _, sinr_ru_db = select_best_ru_block(sinr_pc, ru_type_est)
+            mcs = select_mcs(sinr_ru_db)
+            # Round assignment: no peer info → round_robin worst-case
+            round_idx = assign_scheduling_round(
+                float(np.mean(sinr_pc)), [], n_cell_est, ru_type_est,
+                SCHEDULING_METHOD,
+            )
+            T_comm_round = compute_comm_delay(R_hat_val, mcs)
+            T_comm  = round_idx * T_comm_round
 
             # Edge weight — polling-deadline penalty (matches env.py semantics)
             w = T_move + lambda_c * max(0.0, T_comm - T_POLL)
@@ -304,8 +330,10 @@ def supervised_dual_branch_path(grid_positions, neighbors, csi_map, sinr_map,
         cur = best_nbr
 
         # Update state history — normalized, matches env.py
-        sinr     = sinr_map.get(cur, np.zeros(NUM_DATA_SC))
-        sinr_db  = float(10 * np.log10(np.mean(sinr) + 1e-12))
+        sinr_dict = sinr_map.get(cur, {})
+        ap_cur    = _nearest_ap(grid_positions[cur])
+        sinr      = sinr_dict.get(ap_cur, np.zeros(NUM_DATA_SC, dtype=np.float32))
+        sinr_db   = float(10 * np.log10(np.mean(sinr) + 1e-12))
         mcs      = select_mcs(sinr_db)
         n_cell   = 1
         ru       = get_ru_type(n_cell)
