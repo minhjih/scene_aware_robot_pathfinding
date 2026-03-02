@@ -9,7 +9,7 @@ Coordinate system: Sionna Y-forward, Z-up.
 Grid index [xi, yi] maps to world position [xi*2+1, height, -1.5+yi*(-2)].
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python src/precompute_csi.py [--scene car_factory_2line]
+    CUDA_VISIBLE_DEVICES=0 python src/precompute_csi.py [--scene car_factory_2line]
 
 Sionna 1.2.1 key API changes from 0.18.0:
   - scene.compute_paths() → PathSolver()(scene, ...)
@@ -18,7 +18,7 @@ Sionna 1.2.1 key API changes from 0.18.0:
   - PathSolver uses samples_per_src (not num_samples), diffuse_reflection (not scattering)
 """
 import os, sys, pickle, time, argparse
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"   # GPU 0 has hardware error; use GPU 1 (RTX 3090)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -3,7 +3,7 @@ Evaluation script: runs all baselines and the proposed method across
 scenarios S1–S4, computes metrics, and saves results to results/.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=1 python src/evaluate.py \
+    CUDA_VISIBLE_DEVICES=0 python src/evaluate.py \
         --csi_map data/csi_map.pkl \
         --checkpoint checkpoints/best_model.pt \
         --n_trials 100

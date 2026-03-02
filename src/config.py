@@ -30,7 +30,7 @@ GRID_COORDS_JSON   = os.path.join(SCENE_DIR,
 CSI_MAP_PATH       = os.path.join(DATA_DIR, "csi_map.pkl")
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
-CUDA_DEVICE = "1"   # Use GPU 1 only
+CUDA_DEVICE = "0"
 
 # ── Sionna scene coordinate system ───────────────────────────────────────────
 # Sionna: Y-forward, Z-up.  Position tuple order = [x, z, y].
